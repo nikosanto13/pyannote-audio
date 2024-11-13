@@ -432,6 +432,7 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
 
         embeddings = (
             self.encode_batch(signals, wav_lens=wav_lens)
+            .to(torch.float32)
             .squeeze(dim=1)
             .cpu()
             .numpy()
@@ -790,7 +791,8 @@ class PyannoteAudioPretrainedSpeakerEmbedding(BaseInference):
                         frames = self.model_.resnet.forward_frames(fbank)
 
                     # apply the mask to the frames (to duplicate them again)
-                    frames = frames[repeat_masks]
+                    _, inv_idx = torch.unique(repeat_masks, sorted=True, return_inverse=True)
+                    frames = frames[inv_idx]
 
                     embeddings = self.model_.forward_embedding(frames, weights=masks)
 
