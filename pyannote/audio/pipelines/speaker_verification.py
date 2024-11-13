@@ -65,6 +65,12 @@ except ImportError:
     ONNX_IS_AVAILABLE = False
 
 
+DTYPE_NAME_TO_CLS = {
+    "float32": torch.float32,
+    "float16": torch.float16,
+    "bfloat16": torch.bfloat16,
+}
+
 class NeMoPretrainedSpeakerEmbedding(BaseInference):
     def __init__(
         self,
@@ -211,6 +217,8 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
         Name of SpeechBrain model
     device : torch.device, optional
         Device
+    dtype : str, optional
+        The dtype to use for the embeddings inference.
     use_auth_token : str, optional
         When loading private huggingface.co models, set `use_auth_token`
         to True or to a string containing your hugginface.co authentication
@@ -235,6 +243,7 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
         self,
         embedding: Text = "speechbrain/spkrec-ecapa-voxceleb",
         device: Optional[torch.device] = None,
+        dtype: str = "float32",
         use_auth_token: Union[Text, None] = None,
     ):
         if not SPEECHBRAIN_IS_AVAILABLE:
@@ -260,6 +269,7 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
             use_auth_token=self.use_auth_token,
             revision=self.revision,
         )
+        self.dtype = DTYPE_NAME_TO_CLS[dtype]
 
     def to(self, device: torch.device):
         if not isinstance(device, torch.device):
@@ -308,6 +318,56 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
                 middle = (lower + upper) // 2
 
         return upper
+
+    def encode_batch(
+        self,
+        wavs: torch.Tensor,
+        wav_lens: torch.Tensor,
+        normalize: bool = False
+    ):
+        """ Override speechbrain.inference.EncoderClassifier encode_batch method to run the
+        embedding model in autocast mode. Wrapping the entire encode_batch method in autocast
+        is problematic, since some parts (e.g. compute_features) suffer from numerical
+        instabilities.
+
+        Parameters
+        ----------
+        wavs : torch.Tensor
+            See speechbrain.inference.EncoderClassifier encode_batch method
+        wav_lens : torch.Tensor
+            See speechbrain.inference.EncoderClassifier encode_batch method
+        normalize : bool, optional
+            See speechbrain.inference.EncoderClassifier encode_batch method
+
+        Returns
+        -------
+        torch.Tensor
+            The encoded batch
+        """
+
+        if len(wavs.shape) == 1:
+            wavs = wavs.unsqueeze(0)
+
+        # Assign full length if wav_lens is not assigned
+        if wav_lens is None:
+            wav_lens = torch.ones(wavs.shape[0], device=self.device)
+
+        # Storing waveform in the specified device
+        wavs, wav_lens = wavs.to(self.device), wav_lens.to(self.device)
+        wavs = wavs.float()
+
+        # Computing features and embeddings
+        feats = self.classifier_.mods.compute_features(wavs)
+        feats = self.classifier_.mods.mean_var_norm(feats, wav_lens)
+
+        with torch.autocast(device_type=self.device.type, dtype=self.dtype):
+            embeddings = self.classifier_.mods.embedding_model(feats, wav_lens)
+
+        if normalize:
+            embeddings = self.classifier_.hparams.mean_var_norm_emb(
+                embeddings, torch.ones(embeddings.shape[0], device=self.device)
+            )
+        return embeddings
 
     def __call__(
         self, waveforms: torch.Tensor, masks: Optional[torch.Tensor] = None
@@ -371,7 +431,7 @@ class SpeechBrainPretrainedSpeakerEmbedding(BaseInference):
         wav_lens[too_short] = 1.0
 
         embeddings = (
-            self.classifier_.encode_batch(signals, wav_lens=wav_lens)
+            self.encode_batch(signals, wav_lens=wav_lens)
             .squeeze(dim=1)
             .cpu()
             .numpy()
@@ -618,6 +678,8 @@ class PyannoteAudioPretrainedSpeakerEmbedding(BaseInference):
         pyannote.audio model
     device : torch.device, optional
         Device
+    dtype : str, optional
+        The dtype to use for the embeddings inference.
     use_auth_token : str, optional
         When loading private huggingface.co models, set `use_auth_token`
         to True or to a string containing your hugginface.co authentication
@@ -642,6 +704,7 @@ class PyannoteAudioPretrainedSpeakerEmbedding(BaseInference):
         self,
         embedding: PipelineModel = "pyannote/embedding",
         device: Optional[torch.device] = None,
+        dtype: str = "float32",
         use_auth_token: Union[Text, None] = None,
     ):
         super().__init__()
@@ -651,6 +714,8 @@ class PyannoteAudioPretrainedSpeakerEmbedding(BaseInference):
         self.model_: Model = get_model(self.embedding, use_auth_token=use_auth_token)
         self.model_.eval()
         self.model_.to(self.device)
+
+        self.dtype = DTYPE_NAME_TO_CLS[dtype]
 
     def to(self, device: torch.device):
         if not isinstance(device, torch.device):
@@ -691,23 +756,51 @@ class PyannoteAudioPretrainedSpeakerEmbedding(BaseInference):
         return upper
 
     def __call__(
-        self, waveforms: torch.Tensor, masks: Optional[torch.Tensor] = None
+        self,
+        waveforms: torch.Tensor,
+        masks: Optional[torch.Tensor] = None,
+        repeat_masks: Optional[torch.Tensor] = None,
     ) -> np.ndarray:
+
+        waveforms = waveforms.to(self.device)
+        masks = masks.to(self.device) if masks is not None else None
+
         with torch.inference_mode():
             if masks is None:
-                embeddings = self.model_(waveforms.to(self.device))
+                embeddings = self.model_(waveforms)
             else:
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    embeddings = self.model_(
-                        waveforms.to(self.device), weights=masks.to(self.device)
-                    )
+                if repeat_masks is None:
+                    embeddings = self.model_(waveforms, weights=masks)
+                else:
+                    # as in the case of speechbrain speaker embedding pipeline, we localize the
+                    # autocast context manager to the forward pass of the resnet, avoiding to
+                    # include other parts which suffer from numerical instability (such as the
+                    # compute fbank)
+
+                    # find indices where the `repeat_mask` changes
+                    starting_idx = (repeat_masks[1:] != repeat_masks[:-1]).nonzero(as_tuple=True)[0] + 1
+                    starting_idx = torch.cat((torch.tensor([0]), starting_idx))
+
+                    # run the first stage of the model only once for each unique
+                    # waveform
+                    waveforms_dedup = waveforms[starting_idx]
+                    #frames = self.model_.forward_frames(waveforms_dedup)
+                    fbank = self.model_.compute_fbank(waveforms_dedup)
+                    with torch.autocast(self.device.type, self.dtype):
+                        frames = self.model_.resnet.forward_frames(fbank)
+
+                    # apply the mask to the frames (to duplicate them again)
+                    frames = frames[repeat_masks]
+
+                    embeddings = self.model_.forward_embedding(frames, weights=masks)
+
         return embeddings.cpu().numpy()
 
 
 def PretrainedSpeakerEmbedding(
     embedding: PipelineModel,
     device: Optional[torch.device] = None,
+    dtype: str = "float32",
     use_auth_token: Union[Text, None] = None,
 ):
     """Pretrained speaker embedding
@@ -719,6 +812,11 @@ def PretrainedSpeakerEmbedding(
         or a pyannote.audio model.
     device : torch.device, optional
         Device
+    dtype: str, optional
+        The dtype to use for the embeddings inference. Only relevent for the following pipelines:
+            - SpeechBrainPretrainedSpeakerEmbedding
+            - PyannoteAudioPretrainedSpeakerEmbedding
+        Available options are ['float32', 'float16', 'bfloat16']. Defaults to 'float32'.
     use_auth_token : str, optional
         When loading private huggingface.co models, set `use_auth_token`
         to True or to a string containing your hugginface.co authentication
@@ -741,14 +839,16 @@ def PretrainedSpeakerEmbedding(
     >>> embeddings = get_embedding(waveforms, masks=masks)
     """
 
+    # TODO: dtype is supported only for SpeechBrain and PyannoteAudio speaker embedding pipelines
+
     if isinstance(embedding, str) and "pyannote" in embedding:
         return PyannoteAudioPretrainedSpeakerEmbedding(
-            embedding, device=device, use_auth_token=use_auth_token
+            embedding, device=device, dtype=dtype, use_auth_token=use_auth_token
         )
 
     elif isinstance(embedding, str) and "speechbrain" in embedding:
         return SpeechBrainPretrainedSpeakerEmbedding(
-            embedding, device=device, use_auth_token=use_auth_token
+            embedding, device=device, dtype=dtype, use_auth_token=use_auth_token
         )
 
     elif isinstance(embedding, str) and "nvidia" in embedding:
@@ -760,7 +860,7 @@ def PretrainedSpeakerEmbedding(
     else:
         # fallback to pyannote in case we are loading a local model
         return PyannoteAudioPretrainedSpeakerEmbedding(
-            embedding, device=device, use_auth_token=use_auth_token
+            embedding, device=device, dtype=dtype, use_auth_token=use_auth_token
         )
 
 
